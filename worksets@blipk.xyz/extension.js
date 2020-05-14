@@ -22,78 +22,117 @@
  * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Credits:
- * This extension was created by using the following gnome-shell extensions
- * as a learning resource:
- * - dash-to-panel@jderose9.github.com.v16.shell-extension
- * - clipboard-indicator@tudmotu.com
- * - workspaces-to-dock@passingthru67.gmail.com
- * - workspace-isolated-dash@n-yuki.v14.shell-extension
- * - historymanager-prefix-search@sustmidown.centrum.cz
- * - minimum-workspaces@philbot9.github.com.v9.shell-extension
- * - gsconnect@andyholmes.github.io
- * Many thanks to those great extensions.
  */
 
 // External imports
+const AppIcon = imports.ui.appDisplay.AppIcon;
 const Main = imports.ui.main;
-const ExtensionSystem = imports.ui.extensionSystem;
-const { extensionUtils } = imports.misc;
-const { Meta, GLib, Gio } = imports.gi;
+const { GObject, Meta, Shell } = imports.gi;
+const AppSystem = Shell.AppSystem.get_default();
 
 // Internal imports
 const Me = imports.misc.extensionUtils.getCurrentExtension();
-const _ = imports.gettext.domain(Me.metadata['gettext-domain']).gettext;
-const { dev, utils, uiUtils } = Me.imports;
-const { panelIndicator, workspaceManager, workspaceView, sessionManager } = Me.imports;
-const scopeName = "worksetsalphaextension";
+const dev = Me.imports.dev;
 
+//This removes running apps from workspaces they don't have any windows on when using standard gnome-shell dash
+//Dash-to-panel and dash-to-dock have their own mechanisms for this, see panelIndicator._onIsolateSwitch()
 
-function init() {
-    extensionUtils.initTranslations();
-    dev.log(scopeName+'.'+arguments.callee.name, "@```````````````````````````````````|");
-}
+// Credit to nyuki's extension workspace-isolated-dash@n-yuki.v14.shell-extension
+var WorkspaceIsolator = class WorkspaceIsolator {
+    constructor() {
+        try {
+        // Extend AppSystem to only return applications running on the active workspace
+        AppSystem._workspace_isolated_dash_nyuki_get_running = AppSystem.get_running;
+        AppSystem.get_running = function() {
+            let running = AppSystem._workspace_isolated_dash_nyuki_get_running();
+            if (Main.overview.visible)
+                return running.filter(WorkspaceIsolator.isActiveApp);
+            else
+                return running;
+        };
+        // Extend App's activate to open a new window if no windows exist on the active workspace
+        Shell.App.prototype._workspace_isolated_dash_nyuki_activate = Shell.App.prototype.activate;
+        Shell.App.prototype.activate = function() {
+            let activeWorkspace = Me.gWorkspaceManager.get_active_workspace();
+            let windows = this.get_windows().filter(w => w.get_workspace().index() == activeWorkspace.index());
 
-function enable() {
-    try {
-    dev.log(scopeName+'.'+arguments.callee.name, "@---------------------------------|");
-    if (Me.session) return; // Already initialized
+            if (windows.length > 0 &&
+                (!(windows.length == 1 && windows[0].skip_taskbar) ||
+                 this.is_on_workspace(activeWorkspace)))
+                return Main.activateWindow(windows[0]);
 
-    // Maintain compatibility with GNOME-Shell 3.30+ as well as previous versions.
-    Me.gScreen = global.screen || global.display;
-    Me.gWorkspaceManager = global.screen || global.workspace_manager;
-    Me.gMonitorManager = global.screen || Meta.MonitorManager.get();
+            if (WorkspaceIsolator.isActiveApp(this))
+                return this._workspace_isolated_dash_nyuki_activate();
 
-    if (ExtensionSystem.connect) Me.extensionChangedHandler = ExtensionSystem.connect('extension-state-changed', enable);
-    Me.settings = extensionUtils.getSettings('org.gnome.shell.extensions.worksets');
+            return this.open_new_window(-1);
+        };
+        // Extend AppIcon's state change to hide 'running' indicator for applications not on the active workspace
+        AppIcon.prototype._workspace_isolated_dash_nyuki__updateRunningStyle = AppIcon.prototype._updateRunningStyle;
+        AppIcon.prototype._updateRunningStyle = function() {
+            if (WorkspaceIsolator.isActiveApp(this.app))
+                this._workspace_isolated_dash_nyuki__updateRunningStyle();
+            else
+                this._dot.hide();
+        };
+        // Refresh when the workspace is switched
+        this._onSwitchWorkspaceId = global.window_manager.connect('switch-workspace', WorkspaceIsolator.refresh);
+        // Refresh whenever there is a restack, including:
+        // - window moved to another workspace
+        // - window created
+        // - window closed
+        this._onRestackedId = Me.gScreen.connect('restacked', WorkspaceIsolator.refresh);
+        } catch(e) { dev.log(e) }
+    }
 
-    // Spawn session
-    Me.session = new sessionManager.SessionManager();
+    destroy() {
+        // Revert the AppSystem function
+        if (AppSystem._workspace_isolated_dash_nyuki_get_running) {
+            AppSystem.get_running = AppSystem._workspace_isolated_dash_nyuki_get_running;
+            delete AppSystem._workspace_isolated_dash_nyuki_get_running;
+        }
+        // Revert the App function
+        if (Shell.App.prototype._workspace_isolated_dash_nyuki_activate) {
+            Shell.App.prototype.activate = Shell.App.prototype._workspace_isolated_dash_nyuki_activate;
+            delete Shell.App.prototype._workspace_isolated_dash_nyuki_activate;
+        }
+        // Revert the AppIcon function
+        if (AppIcon.prototype._workspace_isolated_dash_nyuki__updateRunningStyle) {
+            AppIcon.prototype._updateRunningStyle = AppIcon.prototype._workspace_isolated_dash_nyuki__updateRunningStyle;
+            delete AppIcon.prototype._workspace_isolated_dash_nyuki__updateRunningStyle;
+        }
+        // Disconnect the restacked signal
+        if (this._onRestackedId) {
+            Me.gScreen.disconnect(this._onRestackedId);
+            this._onRestackedId = 0;
+        }
+        // Disconnect the switch-workspace signal
+        if (this._onSwitchWorkspaceId) {
+            global.window_manager.disconnect(this._onSwitchWorkspaceId);
+            this._onSwitchWorkspaceId = 0;
+        }
 
-    dev.log(scopeName+'.'+arguments.callee.name, "@~................................|");
-    } catch(e) { dev.log(scopeName+'.'+arguments.callee.name, e); }
-}
-function disable() {
-    try {
-    dev.log(scopeName+'.'+arguments.callee.name, "!~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|");
+        WorkspaceIsolator.refresh();
+    }
+};
 
-    Me.session.saveSession();
-    if (Me.worksetsIndicator) Me.worksetsIndicator.destroy(); delete Me.worksetsIndicator; delete Main.panel.statusArea['WorksetsIndicator'];
-    if (Me.workspaceIsolater) Me.workspaceIsolater.destroy(); delete Me.workspaceIsolater;
-    if (Me.workspaceManager) Me.workspaceManager.destroy(); delete Me.workspaceManager;
-    if (Me.workspaceViewManager) Me.workspaceViewManager.destroy(); delete Me.workspaceViewManager;
-    if (Me.session) Me.session.destroy(); delete Me.session;
-    if (Me.settings) Me.settings.run_dispose(); delete Me.settings;
-    if (Me.extensionChangedHandler) ExtensionSystem.disconnect(extensionChangedHandler);
+// Check if an application is on the active workspace
+WorkspaceIsolator.isActiveApp = function(app) {
+    return app.is_on_workspace(Me.gWorkspaceManager.get_active_workspace());
+};
+// Refresh dash
+WorkspaceIsolator.refresh = function() {
+    // Update icon state of all running applications
+    let running;
+    if (AppSystem._workspace_isolated_dash_nyuki_get_running)
+        running = AppSystem._workspace_isolated_dash_nyuki_get_running();
+    else
+        running = AppSystem.get_running();
 
-    dev.log(scopeName+'.'+arguments.callee.name, "!^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^|"+'\r\n');
-    } catch(e) { dev.log(scopeName+'.'+arguments.callee.name, e); }
+    running.forEach(function(app) {
+        app.notify('state');
+    });
 
-}
-
-// 3.0 API backward compatibility
-function main() {
-    init();
-    enable();
-}
+    // Update applications shown in the dash
+    let dash = Main.overview._dash || Main.overview.dash;
+    dash._queueRedisplay();
+};
